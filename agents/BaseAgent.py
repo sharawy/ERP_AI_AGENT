@@ -6,7 +6,7 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from tools.sql_tool import SQLTool
 from tools.vector_rag_tool import VectorRAGTool
-from llm import call_gemini_prompt, LLMError
+from llm import call_gemini_prompt
 
 class BaseAgent:
     """Base class for all agents to enforce a consistent model context protocol."""

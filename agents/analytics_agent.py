@@ -143,7 +143,7 @@ class AnalyticsAgent(BaseAgent):
             elif action_type == "custom_query":
                 # Generate SQL using text-to-SQL
                 try:
-                    sql_queries = generate_sql("analytics", query)
+                    sql_queries = TextToSQLTool.generate_sql(query, "analytics")
                     if sql_queries:
                         results = []
                         for sql in sql_queries:

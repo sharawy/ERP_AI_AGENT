@@ -9,6 +9,7 @@ It provides domain-specific RAG tools for different business areas.
 from __future__ import annotations
 
 import logging
+import time
 
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
@@ -182,12 +183,14 @@ class VectorRAGTool:
     def _generate_embeddings(self, texts: List[str]) -> List[List[float]]:
         """Generate embeddings using GoogleGenerativeAIEmbeddings."""
         try:
-            embedder = GoogleGenerativeAIEmbeddings(model="models/embedding-001",)
+            embedder = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001",)
             return embedder.embed_documents(texts)
         except Exception as e:
-            # log traceback
+            if "quota" in str(e).lower():
+                logging.error("Quota exceeded. Retrying after a delay...")
+                time.sleep(60)  # Wait for 1 minute before retrying
+                return self._generate_embeddings(texts)  # Retry the request
             logging.error(f"Error generating embeddings: {e}")
-            # Skip documents with errors instead of returning zero embeddings
             return []
 
     def search(

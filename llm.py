@@ -39,7 +39,7 @@ class LLMError(RuntimeError):
 
 
 
-def get_gemini_client(model: str = "gemini-2.5-flash", temperature: float = 0.1) -> ChatGoogleGenerativeAI:
+def get_gemini_client(model: str = "gemini-2.5-flash-lite", temperature: float = 0.1) -> ChatGoogleGenerativeAI:
     """Initialize and return a ChatGoogleGenerativeAI client."""
     api_key = os.getenv("GOOGLE_API_KEY")  # Ensure the API key is set
     if not api_key:
