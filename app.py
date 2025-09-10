@@ -10,6 +10,10 @@ using the LLM.
 
 from __future__ import annotations
 
+import logging
+import os
+
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 
 from agents import (
@@ -26,8 +30,8 @@ from tools.audit_logger import GlobalState
 
 
 app = FastAPI(title="Agent‑Driven ERP API")
-
-
+logging.basicConfig(level=logging.ERROR, format="%(asctime)s - %(levelname)s - %(message)s")
+load_dotenv()
 # Instantiate agents once at startup
 sales_agent = SalesAgent()
 finance_agent = FinanceAgent()
@@ -73,6 +77,8 @@ def chat_endpoint(req: ChatRequest) -> ChatResponse:
         GlobalState.set_last_module("router")
         
     except Exception as e:
+        print(e)
+        logging.error(e)
         raise HTTPException(status_code=500, detail=str(e))
     return ChatResponse(conversation_id=result["conversation_id"], response=result["response"])
 

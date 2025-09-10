@@ -22,7 +22,7 @@ sales_sql.write(
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, Sequence, Tuple, Union
+from typing import Any, List, Optional, Sequence, Tuple, Union, Dict
 
 import database
 
@@ -53,3 +53,16 @@ class SQLTool:
             # `lastrowid` will be meaningful for INSERTs; for updates it will
             # reflect the last inserted row in the transaction.
             return cur.lastrowid
+
+    def execute_sql(self, sql: str, params: Dict[str, Any] | None = None):
+        """Execute a SQL query and return the results or row count."""
+        # Naive safety: block DDL and cross-table wild writes
+        bad = ["DROP ", "ALTER ", "TRUNCATE ", "ATTACH ", "DETACH ", "PRAGMA "]
+        if any(b in sql.upper() for b in bad):
+            raise ValueError("Unsafe SQL blocked")
+
+        try:
+            rows = database.query(sql, params)
+            return database.to_dicts(rows)
+        except Exception:
+            return {"rowcount": database.rowcount(sql, params)}

@@ -14,6 +14,9 @@ from __future__ import annotations
 import random
 from typing import Any, Dict, List, Optional
 
+from langchain_core.prompts import ChatPromptTemplate
+
+from agents.BaseAgent import BaseAgent
 from llm import call_gemini_prompt, LLMError
 from tools.sql_tool import SQLTool
 from tools.vector_rag_tool import VectorRAGTool, PolicyRAGTool
@@ -23,11 +26,11 @@ from tools.audit_logger import audit_agent_method
 from tools.memory_manager import EntityMemory
 
 
-class FinanceAgent:
+class FinanceAgent(BaseAgent):
     def __init__(self) -> None:
         self.sql = SQLTool("finance")
         self.rag = VectorRAGTool("main_documents")  # General RAG
-        
+        self.domain = 'finance'
         # Domain-specific RAG tools as per requirements
         try:
             self.policy_rag = PolicyRAGTool()
@@ -35,24 +38,133 @@ class FinanceAgent:
             print(f"Warning: Could not initialize PolicyRAGTool: {e}")
             self.policy_rag = None
 
-    def handle_query(self, query: str, conversation_id: Optional[int] = None) -> str:
-        q = query.lower()
+    def get_default_intent_prompt(self, query: str) -> str:
+        """Return a default system prompt for intent analysis."""
+        finance_prompt = ChatPromptTemplate.from_template("""You are an assistant for the {domain} domain.
+        Analyze the user's query and classify the type of action needed.
+        query: {query}
+        Respond with ONLY a JSON object:
+        {{
+            "action_type": "list_invoices|list_payments|create_invoice|post_invoice|answer_policy|other",
+            "filters": ["list of filters or conditions"],
+            "context": "brief description of what the user wants",
+            "entities": {{
+                "amount": "extracted amount if present",
+                "invoice_number": "extracted invoice number if present",
+                "customer": "extracted customer info if present",
+                "order_id": "extracted order id if present"
+            }}
+        }}
+        Additional Notes:
+        - Use 'create_invoice' when the user wants to create an invoice with a specified amount
+        - Use 'post_invoice' when the user wants to create an invoice from an existing order
+        - Use 'answer_policy' for questions about finance policies, procedures, or regulations
+        - Extract specific amounts, invoice numbers, customer names, or order IDs if mentioned
+        - For amounts, include only the numeric value without currency symbols""")
+        messages = finance_prompt.format_messages(domain=self.domain, query=query)
+        return messages[0].content
+
+    def _create_invoice_from_order(self, query: str, entities: Dict[str, Any]) -> str:
+        """Create an invoice from an existing order with line items."""
         try:
-            if "invoices" in q and ("list" in q or "show" in q):
+            # Try to get order_id from entities if available
+            order_id = entities.get("order_id")
+
+            # SQL to fetch the order (either specific or most recent)
+            sql = "SELECT id, customer_id, total FROM orders"
+            params = None
+
+            if order_id:
+                sql += " WHERE id = ?"
+                params = (order_id,)
+            else:
+                sql += " ORDER BY id DESC LIMIT 1"
+
+            rows = self.sql.read(sql, params)
+            if not rows:
+                return self._summarise("No orders found to create an invoice.", query)
+
+            order = rows[0]
+            order_id = order["id"]
+
+            # Create invoice number based on order ID
+            inv_no = f"INV-{order_id:05d}"
+
+            # Insert invoice record
+            invoice_id = self.sql.write(
+                "INSERT INTO invoices (customer_id, invoice_number, issue_date, due_date, total_amount, status) "
+                "VALUES (?, ?, DATE('now'), DATE('now','+30 day'), ?, 'unpaid')",
+                (order["customer_id"], inv_no, order["total"])
+            )
+
+            # Create invoice lines from order items
+            items = self.sql.read(
+                "SELECT product_id, quantity, price FROM order_items WHERE order_id = ?",
+                (order_id,)
+            )
+
+            for item in items:
+                self.sql.write(
+                    "INSERT INTO invoice_lines (invoice_id, description, quantity, unit_price) "
+                    "VALUES (?, ?, ?, ?)",
+                    (invoice_id, f"Product {item['product_id']}", item["quantity"], item["price"])
+                )
+
+            # Check for anomalies in the order total
+            anomaly_detector = AnomalyDetectionTool()
+            score = anomaly_detector.score(float(order["total"]))
+
+            result = {}
+            if score > 0.8:
+                # Request approval for suspicious amounts
+                from tools.approval_system import request_approval
+                request_approval("finance", {"invoice_id": invoice_id, "reason": "Anomaly score high", "score": score})
+                result = {
+                    "invoice_number": inv_no,
+                    "invoice_id": invoice_id,
+                    "anomaly_score": score,
+                    "status": "approval_requested"
+                }
+            else:
+                result = {
+                    "invoice_number": inv_no,
+                    "invoice_id": invoice_id,
+                    "status": "created"
+                }
+
+            return self._summarise(str(result), query)
+
+        except Exception as e:
+            return self._summarise(f"Failed to create invoice from order: {str(e)}", query)
+
+
+    def handle_query(self, query: str, conversation_id: Optional[int] = None) -> str:
+        try:
+            # Step 1: Understand what the user wants
+            intent = self._analyze_intent(query)
+
+            # Step 2: Process based on the intent action_type
+            action_type = intent.get("action_type", "other")
+            context = intent.get("context", "")
+            entities = intent.get("entities", {})
+
+            # Step 3: Route to the appropriate handler based on action_type
+            if action_type == "list_invoices":
                 return self._list_invoices(query)
-            if "payments" in q and ("list" in q or "show" in q):
+            elif action_type == "list_payments":
                 return self._list_payments(query)
-            if "invoice" in q and ("create" in q or "new" in q):
+            elif action_type == "create_invoice":
                 return self._create_intelligent_invoice(query)
-            # Check for policy questions first
-            if any(keyword in q for keyword in ["policy", "refund", "procedure", "how", "what is", "what are"]):
+            elif action_type == "post_invoice":
+                return self._create_invoice_from_order(query, entities)
+            elif action_type == "answer_policy":
                 return self._handle_policy_query(query)
-            # Fallback RAG search
+
+            # Fallback RAG search for unclassified queries
             rag_results = self.rag.search(query)
             if rag_results:
-                return self._summarise(
-                    f"RAG search results for '{query}': {rag_results}", query
-                )
+                return self._summarise(f"RAG search results for '{query}': {rag_results}", query)
+
             return "I'm sorry, I couldn't understand your finance request."
         except Exception:
             raise
@@ -83,38 +195,37 @@ class FinanceAgent:
                 rag_results = self.policy_rag.search(query, k=3)
                 if rag_results:
                     return self._summarise_policy_results(rag_results, query)
-            
+
             # Fallback to general RAG
             rag_results = self.rag.search(query, k=3, tags="policy")
             if rag_results:
                 return self._summarise_policy_results(rag_results, query)
-            
-            return f"I couldn't find specific policy information about '{query}'. Please contact the finance department for clarification."
-            
+
+            return self._summarise(f"No policy information found for '{query}'", query)
         except Exception as e:
             print(f"Warning: Policy RAG search failed: {e}")
-            return f"I'm having trouble accessing policy information for '{query}'. Please try again or contact finance support."
+            return self._summarise(f"Error accessing policy information: {str(e)}", query)
 
     def _summarise_policy_results(self, results: list, query: str) -> str:
         """Summarize policy RAG results into a helpful response."""
         if not results:
             return f"I couldn't find policy information about '{query}'."
-        
+
         # Build context from results
         context = ""
         for i, result in enumerate(results[:3], 1):
             context += f"{i}. {result.get('excerpt', '')}\n"
-        
+
         # Use LLM to provide a structured response
         prompt = f"""
-Based on the following finance policy information, answer the user's question: "{query}"
+                Based on the following finance policy information, answer the user's question: "{query}"
+                
+                Relevant policy information:
+                {context}
+                
+                Provide a clear, professional response that addresses the user's question about our finance policies.
+                """
 
-Relevant policy information:
-{context}
-
-Provide a clear, professional response that addresses the user's question about our finance policies.
-"""
-        
         try:
             response = call_gemini_prompt(prompt)
             return response.strip()
@@ -134,7 +245,7 @@ Provide a clear, professional response that addresses the user's question about 
     def _create_intelligent_invoice(self, query: str) -> str:
         """Create an invoice with amount extracted from the query."""
         import re
-        
+
         # Extract amount from query using regex
         amount_match = re.search(r'\$?(\d+(?:\.\d{2})?)', query)
         if amount_match:
@@ -142,16 +253,17 @@ Provide a clear, professional response that addresses the user's question about 
         else:
             # Fallback to dummy creation if no amount found
             return self._create_dummy_invoice(query)
-        
+
         try:
             # Pick a random customer
             customers = self.sql.read("SELECT id, name FROM customers")
             if not customers:
-                raise RuntimeError("No customers available to create an invoice")
+                return self._summarise("No customers available to create an invoice", query)
+
             customer = random.choice(customers)
             customer_id = customer["id"]
             customer_name = customer["name"]
-            
+
             # Check if approval is needed
             needs_approval, approval_message = check_and_handle_approval(
                 module="finance",
@@ -160,26 +272,33 @@ Provide a clear, professional response that addresses the user's question about 
                 customer_id=customer_id,
                 customer_name=customer_name
             )
-            
+
             if needs_approval:
-                return approval_message
-            
-            invoice_number = f"INV{random.randint(100000,999999)}"
-            
+                return self._summarise(approval_message, query)
+
+            invoice_number = f"INV{random.randint(100000, 999999)}"
+
             # Create invoice with the requested amount
             invoice_id = self.sql.write(
                 "INSERT INTO invoices (customer_id, invoice_number, issue_date, due_date, total_amount, status, created_at) "
                 "VALUES (?, ?, date('now'), date('now','+30 day'), ?, 'unpaid', datetime('now'))",
                 (customer_id, invoice_number, requested_amount),
             )
-            
+
             # Update customer last contact
             EntityMemory.update_last_contact(customer_id)
-            
-            return f"Successfully created invoice {invoice_number} for {customer_name} with amount ${requested_amount:.2f}. Invoice ID: {invoice_id}"
-            
+
+            result = {
+                "invoice_number": invoice_number,
+                "customer_name": customer_name,
+                "amount": requested_amount,
+                "invoice_id": invoice_id
+            }
+
+            return self._summarise(str(result), query)
+
         except Exception as e:
-            return f"Failed to create invoice: {str(e)}"
+            return self._summarise(f"Failed to create invoice: {str(e)}", query)
 
     def _create_dummy_invoice(self, query: str) -> str:
         """Create a dummy invoice for demonstration purposes.
@@ -203,7 +322,7 @@ Provide a clear, professional response that addresses the user's question about 
         order = random.choice(orders)
         order_id = order["id"]
         total = order["total"]
-        invoice_number = f"INV{random.randint(100000,999999)}"
+        invoice_number = f"INV{random.randint(100000, 999999)}"
         invoice_id = self.sql.write(
             "INSERT INTO invoices (customer_id, invoice_number, issue_date, due_date, total_amount, status, created_at) "
             "VALUES (?, ?, date('now'), date('now','+30 day'), ?, 'unpaid', datetime('now'))",

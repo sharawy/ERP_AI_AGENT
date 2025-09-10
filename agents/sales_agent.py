@@ -16,25 +16,64 @@ from __future__ import annotations
 import random
 from typing import Any, Dict, List, Optional
 
+from langchain_core.prompts import ChatPromptTemplate
+
+from agents.BaseAgent import BaseAgent
 from llm import call_gemini_prompt, LLMError
 from tools.sql_tool import SQLTool
 from tools.vector_rag_tool import VectorRAGTool, SalesRAGTool
 from tools.ml_tools import LeadScoringTool
-from tools.audit_logger import audit_agent_method
-from tools.memory_manager import EntityMemory
 
 
-class SalesAgent:
+
+class SalesAgent(BaseAgent):
     def __init__(self) -> None:
         self.sql = SQLTool("sales")
         self.rag = VectorRAGTool("main_documents")  # General RAG
-        
+        self.domain = "sales"
         # Domain-specific RAG tools as per requirements
         try:
             self.sales_rag = SalesRAGTool()
         except Exception as e:
             print(f"Warning: Could not initialize SalesRAGTool: {e}")
             self.sales_rag = None
+    def get_default_intent_prompt(self, query: str) -> str:
+        intent_prompt = ChatPromptTemplate.from_template(
+        """
+        You are a Sales & CRM agent. Analyze this user query and determine the action needed.
+        
+        Query: {query}
+        
+        You handle: customers, leads, orders, support tickets, products
+        
+        Classify the query into one of these action types:
+        1. "new_lead" - creating a new sales lead
+        2. "new_order" - creating a new order
+        3. "support_ticket" - handling customer support
+        4. "retrieve_customers" - getting customer information
+        5. "retrieve_orders" - getting order information  
+        6. "retrieve_leads" - getting lead information
+        7. "retrieve_products" - getting product information
+        8. "rag_query" - asking about procedures, policies, guidelines, definitions, "how to", "what is", "what are"
+        9. "other" - anything else
+        
+        Key indicators for rag_query:
+        - Questions about procedures, policies, guidelines
+        - "What are our..." / "What is our..." / "How do we..."
+        - Questions about qualification, standards, procedures
+        - Definitional questions
+        
+        Also determine any specific filters or conditions mentioned.
+        
+        Respond with ONLY a JSON object:
+        {{
+            "action_type": "new_lead|new_order|support_ticket|retrieve_customers|retrieve_orders|retrieve_leads|retrieve_products|rag_query|other",
+            "filters": ["cancelled", "recent", "high_value", etc.],
+            "context": "brief description of what user wants"
+        }}
+        """)
+        messages = intent_prompt.format_messages(domain=self.domain, query=query)
+        return messages[0].content
 
     def handle_query(self, query: str, conversation_id: Optional[int] = None) -> str:
         """Intelligently interpret and respond to user queries within the Sales domain.
@@ -45,10 +84,10 @@ class SalesAgent:
         try:
             # Step 1: Understand what the user wants
             intent = self._analyze_intent(query)
-            
+
             # Step 2: Execute the appropriate action based on LLM classification
             action_type = intent.get("action_type", "other")
-            
+
             if action_type.startswith("retrieve_"):
                 return self._handle_retrieval_action(action_type, intent, query)
             elif action_type in ["new_lead", "new_order", "support_ticket"]:
@@ -68,70 +107,16 @@ class SalesAgent:
             # Re-raise so the router can log the error
             raise
 
-    def _analyze_intent(self, query: str) -> dict:
-        """Use LLM to understand user intent and classify the type of action needed."""
-        prompt = f"""
-You are a Sales & CRM agent. Analyze this user query and determine the action needed.
-
-Query: "{query}"
-
-You handle: customers, leads, orders, support tickets, products
-
-Classify the query into one of these action types:
-1. "new_lead" - creating a new sales lead
-2. "new_order" - creating a new order
-3. "support_ticket" - handling customer support
-4. "retrieve_customers" - getting customer information
-5. "retrieve_orders" - getting order information  
-6. "retrieve_leads" - getting lead information
-7. "retrieve_products" - getting product information
-8. "rag_query" - asking about procedures, policies, guidelines, definitions, "how to", "what is", "what are"
-9. "other" - anything else
-
-Key indicators for rag_query:
-- Questions about procedures, policies, guidelines
-- "What are our..." / "What is our..." / "How do we..."
-- Questions about qualification, standards, procedures
-- Definitional questions
-
-Also determine any specific filters or conditions mentioned.
-
-Respond with ONLY a JSON object:
-{{
-    "action_type": "new_lead|new_order|support_ticket|retrieve_customers|retrieve_orders|retrieve_leads|retrieve_products|rag_query|other",
-    "filters": ["cancelled", "recent", "high_value", etc.],
-    "context": "brief description of what user wants"
-}}
-"""
-        
-        try:
-            response = call_gemini_prompt(prompt)
-            # Clean up response and parse JSON
-            response = response.strip()
-            if response.startswith("```json"):
-                response = response[7:-3]
-            elif response.startswith("```"):
-                response = response[3:-3]
-            
-            import json
-            return json.loads(response)
-        except Exception as e:
-            # Fallback intent
-            return {
-                "action_type": "retrieve_orders",
-                "filters": [],
-                "context": "general query"
-            }
 
     def _handle_retrieval_action(self, action_type: str, intent: dict, original_query: str) -> str:
         """Handle data retrieval actions by generating SQL and analyzing results."""
         # Step 1: Generate SQL query using LLM
         sql_query = self._generate_sql_for_action(action_type, intent, original_query)
-        
+
         try:
             # Step 2: Execute the query
             rows = self.sql.read(sql_query)
-            
+
             # Step 3: Use LLM to analyze results and provide intelligent response
             return self._analyze_results_and_respond(rows, action_type, original_query, intent)
         except Exception as e:
@@ -149,43 +134,43 @@ Respond with ONLY a JSON object:
         - leads: id, customer_name, contact_email, message, score, status, created_at
         - tickets: id, customer_id, subject, message, status, priority, created_at
         """
-        
+
         prompt = f"""
-You are a Sales & CRM agent generating SQL queries for a SQLite database.
+            You are a Sales & CRM agent generating SQL queries for a SQLite database.
+            
+            User query: "{original_query}"
+            Action type: {action_type}
+            Filters mentioned: {intent.get("filters", [])}
+            Context: {intent.get("context", "")}
+            
+            {schema_info}
+            
+            Generate a SQL query to fulfill this request. Requirements:
+            - Select appropriate columns for the action type
+            - Use JOINs when needed (especially orders with customers)
+            - Apply filters based on user intent (cancelled, recent, high_value, etc.)
+            - Sort by most relevant field
+            - Use ONLY SQLite-compatible syntax
+            - For LIMIT values, use only integer numbers, not expressions
+            - For "recent" or "latest" queries: Simply ORDER BY created_at DESC with LIMIT - do NOT use date filters
+            - Only use date filters when user specifically mentions timeframes like "last week", "this month", etc.
+            - Use appropriate LIMIT based on the request:
+              * "all" or "every" = no LIMIT
+              * "recent" or "latest" = LIMIT 10
+              * "top" or "best" = LIMIT 10
+              * "show me" = LIMIT 20
+              * specific count mentioned = use that exact number
+              * default = LIMIT 20
+            
+            Important: Respond with ONLY a valid SQL query, no backticks, no explanation, no formatting.
+            Example formats:
+            - Recent orders: SELECT o.id, c.name FROM orders o JOIN customers c ON o.customer_id = c.id ORDER BY o.created_at DESC LIMIT 10
+            - Show orders: SELECT o.id, c.name FROM orders o JOIN customers c ON o.customer_id = c.id ORDER BY o.created_at DESC LIMIT 20
+            """
 
-User query: "{original_query}"
-Action type: {action_type}
-Filters mentioned: {intent.get("filters", [])}
-Context: {intent.get("context", "")}
-
-{schema_info}
-
-Generate a SQL query to fulfill this request. Requirements:
-- Select appropriate columns for the action type
-- Use JOINs when needed (especially orders with customers)
-- Apply filters based on user intent (cancelled, recent, high_value, etc.)
-- Sort by most relevant field
-- Use ONLY SQLite-compatible syntax
-- For LIMIT values, use only integer numbers, not expressions
-- For "recent" or "latest" queries: Simply ORDER BY created_at DESC with LIMIT - do NOT use date filters
-- Only use date filters when user specifically mentions timeframes like "last week", "this month", etc.
-- Use appropriate LIMIT based on the request:
-  * "all" or "every" = no LIMIT
-  * "recent" or "latest" = LIMIT 10
-  * "top" or "best" = LIMIT 10
-  * "show me" = LIMIT 20
-  * specific count mentioned = use that exact number
-  * default = LIMIT 20
-
-Important: Respond with ONLY a valid SQL query, no backticks, no explanation, no formatting.
-Example formats:
-- Recent orders: SELECT o.id, c.name FROM orders o JOIN customers c ON o.customer_id = c.id ORDER BY o.created_at DESC LIMIT 10
-- Show orders: SELECT o.id, c.name FROM orders o JOIN customers c ON o.customer_id = c.id ORDER BY o.created_at DESC LIMIT 20
-"""
-        
         try:
             sql_query = call_gemini_prompt(prompt).strip()
-            
+
             # Clean up the response
             if sql_query.startswith("```sql"):
                 sql_query = sql_query[6:-3].strip()
@@ -206,7 +191,7 @@ Example formats:
         """Use LLM to analyze results and provide intelligent, contextual response with RAG context."""
         if not rows:
             return f"I couldn't find any data matching your criteria for: {original_query}"
-        
+
         # Get contextual information from RAG as specified in requirements
         rag_context = ""
         if self.sales_rag:
@@ -218,7 +203,7 @@ Example formats:
                         rag_context += f"- {result['excerpt']}\n"
             except Exception as e:
                 print(f"Warning: RAG search failed: {e}")
-        
+
         prompt = f"""
 You are a Sales & CRM expert analyzing data for a business user.
 
@@ -238,7 +223,7 @@ Provide a professional response that:
 
 Be conversational, helpful, and business-focused.
 """
-        
+
         return call_gemini_prompt(prompt)
 
     def _handle_rag_query(self, query: str) -> str:
@@ -249,14 +234,14 @@ Be conversational, helpful, and business-focused.
                 rag_results = self.sales_rag.search(query, k=3)
                 if rag_results:
                     return self._summarise_rag_results(rag_results, query, "sales procedures")
-            
+
             # Fallback to general RAG
             rag_results = self.rag.search(query, k=3)
             if rag_results:
                 return self._summarise_rag_results(rag_results, query, "documentation")
-            
+
             return f"I couldn't find any relevant information about '{query}' in our sales documentation. You might want to contact your sales manager for specific procedures."
-            
+
         except Exception as e:
             print(f"Warning: RAG search failed: {e}")
             return f"I'm having trouble accessing the documentation for '{query}'. Please try again or contact support."
@@ -265,12 +250,12 @@ Be conversational, helpful, and business-focused.
         """Summarize RAG results into a helpful response."""
         if not results:
             return f"I couldn't find information about '{query}' in our {source_type}."
-        
+
         # Build context from results
         context = ""
         for i, result in enumerate(results[:3], 1):
             context += f"{i}. {result.get('excerpt', '')}\n"
-        
+
         # Use LLM to provide a structured response
         prompt = f"""
 Based on the following information from our {source_type}, answer the user's question: "{query}"
@@ -280,7 +265,7 @@ Relevant information:
 
 Provide a clear, helpful response that addresses the user's question. Be professional and specific.
 """
-        
+
         try:
             response = call_gemini_prompt(prompt)
             return response.strip()
@@ -301,7 +286,7 @@ Provide a clear, helpful response that addresses the user's question. Be profess
 
     def _create_intelligent_lead(self, original_query: str, intent: dict) -> str:
         """Create a lead using LLM to extract information with RAG context."""
-        
+
         # Get relevant procedures for lead creation
         rag_context = ""
         if self.sales_rag:
@@ -313,7 +298,7 @@ Provide a clear, helpful response that addresses the user's question. Be profess
                         rag_context += f"- {result['excerpt']}\n"
             except Exception as e:
                 print(f"Warning: RAG search failed: {e}")
-        
+
         prompt = f"""
 Extract lead information from this request:
 "{original_query}"
@@ -345,29 +330,29 @@ Examples:
 - "Create lead for Jane Doe, email jane@example.com" -> customer_name: "Jane Doe", contact_email: "jane@example.com"
 - "John Smith at TechCorp, email john@techcorp.com" -> customer_name: "John Smith", contact_email: "john@techcorp.com"
 """
-        
+
         try:
             response = call_gemini_prompt(prompt)
             # Parse the lead info and create the lead
             import json
-            
+
             # Clean up the response to extract JSON
             response_clean = response.strip()
             if response_clean.startswith("```json"):
                 response_clean = response_clean[7:-3].strip()
             elif response_clean.startswith("```"):
                 response_clean = response_clean[3:-3].strip()
-            
+
             lead_info = json.loads(response_clean)
-            
+
             customer_name = lead_info.get("customer_name", f"Lead {random.randint(1000, 9999)}")
-            contact_email = lead_info.get("contact_email", f"lead{random.randint(1000,9999)}@example.com")
+            contact_email = lead_info.get("contact_email", f"lead{random.randint(1000, 9999)}@example.com")
             message = lead_info.get("message", "Lead created via chat interface")
-            
+
             # Use ML tool for lead scoring
             scoring_result = LeadScoringTool.score_lead(customer_name, contact_email, message)
             ml_score = scoring_result.get("score", 0.5)
-            
+
             # Create the lead in database
             sql = """
                 INSERT INTO leads (customer_name, contact_email, message, score, status, created_at) 
@@ -379,16 +364,16 @@ Examples:
                 message,
                 ml_score
             ))
-            
+
             # Store lead scoring details in entity memory if we have a customer ID
             # For now, we'll just include the scoring info in the response
             confidence = scoring_result.get("confidence", "medium")
             reasoning = scoring_result.get("reasoning", "Standard lead scoring applied")
-            
+
             return (f"Successfully created new lead (ID: {lead_id}) for {customer_name}. "
-                   f"Lead score: {ml_score:.2f} (confidence: {confidence}). "
-                   f"Scoring rationale: {reasoning}. The lead has been assigned for follow-up.")
-            
+                    f"Lead score: {ml_score:.2f} (confidence: {confidence}). "
+                    f"Scoring rationale: {reasoning}. The lead has been assigned for follow-up.")
+
         except Exception as e:
             # Fallback to simple lead creation
             return self._create_dummy_lead(original_query)
@@ -411,12 +396,12 @@ Create JSON with:
     "priority": "low|medium|high"
 }}
 """
-        
+
         try:
             response = call_gemini_prompt(prompt)
             import json
             ticket_info = json.loads(response.strip())
-            
+
             # Create ticket (using customer_id = 1 as default)
             sql = """
                 INSERT INTO tickets (customer_id, subject, message, status, priority, created_at)
@@ -428,9 +413,9 @@ Create JSON with:
                 ticket_info.get("message", original_query),
                 ticket_info.get("priority", "medium")
             ))
-            
+
             return f"Support ticket #{ticket_id} created successfully. Subject: {ticket_info.get('subject')}. Our team will respond soon."
-            
+
         except Exception as e:
             return f"I've created a support ticket for your request: '{original_query}'. Our team will follow up with you soon."
 
@@ -458,7 +443,7 @@ Create JSON with:
             "limit": number or null
         }}
         """
-        
+
         try:
             response = call_gemini_prompt(prompt)
             # Parse the JSON response
@@ -479,14 +464,14 @@ Create JSON with:
         entity = intent.get("entity", "orders")
         filters = intent.get("filters", [])
         limit = intent.get("limit", 5)
-        
+
         # Generate SQL query based on intent
         sql_query = self._generate_sql_query(entity, filters, limit)
-        
+
         try:
             # Execute the query
             rows = self.sql.read(sql_query)
-            
+
             # Process and analyze the results intelligently
             return self._analyze_and_respond(rows, entity, original_query, intent)
         except Exception as e:
@@ -522,9 +507,9 @@ Create JSON with:
                 ORDER BY created_at DESC
             """
         }
-        
+
         query = base_queries.get(entity, base_queries["orders"])
-        
+
         # Apply filters if any
         if filters:
             # This is simplified - in a real system you'd parse filters more intelligently
@@ -532,17 +517,17 @@ Create JSON with:
                 query = query.replace("ORDER BY", "WHERE status = 'cancelled' ORDER BY")
             elif "recent" in filters:
                 query = query.replace("ORDER BY", "WHERE created_at >= date('now', '-30 days') ORDER BY")
-        
+
         # Add limit
         query += f" LIMIT {limit}"
-        
+
         return query
 
     def _analyze_and_respond(self, rows: list, entity: str, original_query: str, intent: dict) -> str:
         """Intelligently analyze the data and provide a meaningful response."""
         if not rows:
             return f"I couldn't find any {entity} matching your criteria."
-        
+
         # Create a summary of the data for the LLM to analyze
         data_summary = {
             "entity": entity,
@@ -551,7 +536,7 @@ Create JSON with:
             "original_query": original_query,
             "intent": intent
         }
-        
+
         prompt = f"""
         You are a sales analyst. The user asked: "{original_query}"
         
@@ -562,7 +547,7 @@ Create JSON with:
         Highlight key insights, trends, or important information.
         Be conversational and professional.
         """
-        
+
         return call_gemini_prompt(prompt)
 
     def _execute_create_action(self, intent: dict, original_query: str) -> str:
@@ -626,7 +611,7 @@ Create JSON with:
         a confirmation message summarised by the LLM.
         """
         name = f"Test Lead {random.randint(1000, 9999)}"
-        email = f"test{random.randint(1000,9999)}@example.com"
+        email = f"test{random.randint(1000, 9999)}@example.com"
         message = "Generated by SalesAgent._create_dummy_lead"
         sql = (
             "INSERT INTO leads (customer_name, contact_email, message, score, status, created_at) "

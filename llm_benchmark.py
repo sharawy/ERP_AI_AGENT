@@ -6,7 +6,7 @@ from typing import Dict, Any
 class LLMBenchmark:
     """Simple class to benchmark LLM performance with different query complexities."""
     
-    def __init__(self, lm_studio_url: str = "http://localhost:1234/v1/chat/completions"):
+    def __init__(self, lm_studio_url: str = "http://localhost:1234/v1/completions"):
         self.lm_studio_url = lm_studio_url
         
     def call_llm(self, prompt: str) -> tuple[str, float]:

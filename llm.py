@@ -9,18 +9,22 @@ localhost:1234 by default.
 
 from __future__ import annotations
 
+import logging
+
+from langchain_core.messages import BaseMessage
+
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 import os
 import json
 import requests
 from typing import Any, Dict, Iterable, List, Optional
 from dotenv import load_dotenv
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 # Load environment variables from .env file
 load_dotenv()
 
-def get_lm_studio_url() -> str:
-    """Get the LM Studio API URL from environment or use default."""
-    return os.environ.get("LM_STUDIO_URL", "http://localhost:1234/v1/chat/completions")
+
 
 
 class LLMError(RuntimeError):
@@ -34,139 +38,49 @@ class LLMError(RuntimeError):
     """
 
 
-def check_lm_studio_availability() -> bool:
-    """Check if LM Studio is available and ready to accept requests.
-    
-    Returns:
-        True if LM Studio is available, False otherwise.
-    """
+
+def get_gemini_client(model: str = "gemini-2.5-flash", temperature: float = 0.1) -> ChatGoogleGenerativeAI:
+    """Initialize and return a ChatGoogleGenerativeAI client."""
+    api_key = os.getenv("GOOGLE_API_KEY")  # Ensure the API key is set
+    if not api_key:
+        raise RuntimeError("GOOGLE_API_KEY is not set.")
+    return ChatGoogleGenerativeAI(model=model, api_key=api_key, temperature=temperature)
+
+
+def call_gemini(messages: List[Dict[str, str]]) -> str:
+    """Call the Gemini API with the given messages."""
     try:
-        lm_studio_url = get_lm_studio_url()
-        models_url = lm_studio_url.replace("/v1/chat/completions", "/v1/models")
-        response = requests.get(models_url, timeout=5)
-        return response.status_code == 200
-    except:
-        return False
+        # Log the messages for debugging
+        logging.debug(f"Messages passed to Gemini API: {messages}")
 
+        # Ensure messages are properly formatted
+        if not all(isinstance(msg, dict) and "role" in msg and "content" in msg for msg in messages):
+            raise ValueError("Each message must be a dictionary with 'role' and 'content' keys.")
 
-def call_lm_studio(messages: List[Dict[str, Any]]) -> str:
-    """Send a list of messages to LM Studio and return the response text.
+        client = get_gemini_client()
+        # Use the invoke method instead of __call__
+        response = client.invoke(messages)
+        logging.debug(f"Raw response from Gemini API: {response.content}")
 
-    The `messages` parameter should be a list of dictionaries in OpenAI chat format.
-    Each message has a `role` (one of "user", "assistant", "system") and a `content` field.
-
-    Raises:
-        LLMError: if the request fails.
-    """
-    headers = {"Content-Type": "application/json"}
-    payload = {
-        "messages": messages,
-        "temperature": 0.1,
-        "max_tokens": 1024,
-        "top_p": 0.9,
-        "stream": False
-    }
-    
-    lm_studio_url = get_lm_studio_url()
-    
-    try:
-        response = requests.post(
-            lm_studio_url,
-            headers=headers,
-            json=payload,
-            timeout=60,  # Local LLM might need more time
-        )
-    except requests.exceptions.ConnectionError as exc:
-        raise LLMError(
-            f"Cannot connect to LM Studio at {lm_studio_url}. "
-            f"Please ensure LM Studio is running and the local server is started. "
-            f"Original error: {exc}"
-        ) from exc
-    except requests.exceptions.Timeout as exc:
-        raise LLMError(
-            f"LM Studio API request timed out after 60 seconds. "
-            f"The local LLM might be processing a large request or overloaded. "
-            f"Original error: {exc}"
-        ) from exc
-    except requests.RequestException as exc:
-        raise LLMError(
-            f"Failed to communicate with LM Studio API at {lm_studio_url}. "
-            f"Check that LM Studio is running with the local server enabled. "
-            f"Original error: {exc}"
-        ) from exc
-
-    if response.status_code != 200:
-        # Attempt to extract error message from response body
-        try:
-            error_info = response.json()
-            message = error_info.get("error", {}).get("message", response.text)
-        except Exception:
-            message = response.text
-        
-        # Provide helpful error messages based on status code
-        if response.status_code == 404:
-            raise LLMError(
-                f"LM Studio endpoint not found (404). "
-                f"Please check that LM Studio's local server is running and accessible at {lm_studio_url}. "
-                f"In LM Studio, go to 'Local Server' tab and click 'Start Server'."
-            )
-        elif response.status_code == 500:
-            raise LLMError(
-                f"LM Studio internal server error (500). "
-                f"This might indicate the model is not loaded or there's an issue with the LLM. "
-                f"Please check LM Studio logs. Error: {message}"
-            )
-        elif response.status_code == 503:
-            raise LLMError(
-                f"LM Studio service unavailable (503). "
-                f"The server might be starting up or overloaded. "
-                f"Please wait a moment and try again. Error: {message}"
-            )
+        # Check if the response is a BaseMessage object
+        if isinstance(response, BaseMessage):
+            # Extract content from the BaseMessage object
+            if isinstance(response.content, str):
+                return response.content
+            elif isinstance(response.content, list):
+                # Handle list content if necessary
+                return " ".join(
+                    part["text"] if isinstance(part, dict) and "text" in part else str(part)
+                    for part in response.content
+                )
+            else:
+                raise ValueError("Unexpected content format in BaseMessage.")
         else:
-            raise LLMError(f"LM Studio API returned status {response.status_code}: {message}")
+            raise ValueError(f"Unexpected response type: {type(response)}")
 
-    try:
-        data = response.json()
-        choices = data.get("choices", [])
-        if not choices:
-            raise LLMError("LM Studio API returned no choices")
-        
-        message = choices[0].get("message", {})
-        content = message.get("content")
-        if content is None:
-            raise LLMError("LM Studio response has no content")
-        
-        return content.strip()
-    except (KeyError, IndexError) as e:
-        raise LLMError(f"Failed to parse LM Studio response: {e}")
-
-
-def call_gemini(messages: List[Dict[str, Any]]) -> str:
-    """Compatibility wrapper - converts Gemini format to OpenAI format and calls LM Studio.
-    
-    Converts Gemini's format with 'parts' to standard OpenAI chat format.
-    """
-    # Convert Gemini format to OpenAI format
-    openai_messages = []
-    for msg in messages:
-        role = msg.get("role", "user")
-        # Map Gemini roles to OpenAI roles
-        if role == "model":
-            role = "assistant"
-        
-        # Extract text from parts
-        parts = msg.get("parts", [])
-        if parts and isinstance(parts, list) and len(parts) > 0:
-            content = parts[0].get("text", "")
-        else:
-            content = str(msg.get("content", ""))
-        
-        openai_messages.append({
-            "role": role,
-            "content": content
-        })
-    
-    return call_lm_studio(openai_messages)
+    except Exception as e:
+            logging.error(f"Failed to call Gemini API: {e}")
+            raise LLMError(f"Failed to call Gemini API: {e}")
 
 
 def call_gemini_prompt(prompt: str) -> str:
@@ -181,4 +95,4 @@ def call_gemini_prompt(prompt: str) -> str:
             "content": prompt
         }
     ]
-    return call_lm_studio(messages)
+    return call_gemini(messages)

@@ -69,12 +69,12 @@ class RouterAgent:
             "Classify user requests into exactly one of these domains:\n"
             "- Sales: customer management, leads, orders, products, CRM activities\n"
             "- Finance: invoices, payments, accounting, billing\n"
-            "- Inventory: stock levels, suppliers, purchase orders, warehouse management\n"
+            "- Inventory: stock levels, suppliers, purchase orders, warehouse management, listing and retrieving product information\n"
             "- Analytics: reports, revenue analysis, profit analysis, data insights, trends, statistics\n"
             "Respond with exactly one domain name: Sales, Finance, Inventory, or Analytics."
         )
         messages = [
-            {"role": "user", "parts": [{"text": f"{system_prompt}\n\nUser request: {query}"}]},
+            {"role": "user", "content": [{"text": f"{system_prompt}\n\nUser request: {query}"}]},
         ]
         try:
             response = call_gemini(messages)

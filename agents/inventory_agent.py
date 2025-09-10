@@ -9,19 +9,23 @@ invokes the LLM to summarise the result for the user.
 
 from __future__ import annotations
 
+import logging
 import random
 from typing import Any, Dict, List, Optional
 
+from langchain_core.prompts import ChatPromptTemplate
+
+from agents.BaseAgent import BaseAgent
 from llm import call_gemini_prompt, LLMError
 from tools.sql_tool import SQLTool
 from tools.vector_rag_tool import VectorRAGTool, DocRAGTool
 
 
-class InventoryAgent:
+class InventoryAgent(BaseAgent):
     def __init__(self) -> None:
         self.sql = SQLTool("inventory")
         self.rag = VectorRAGTool("main_documents")  # General RAG
-        
+        self.domain = 'inventory'
         # Domain-specific RAG tools as per requirements
         try:
             self.doc_rag = DocRAGTool()
@@ -29,17 +33,72 @@ class InventoryAgent:
             print(f"Warning: Could not initialize DocRAGTool: {e}")
             self.doc_rag = None
 
+    def get_default_intent_prompt(self, query: str) -> str:
+        """Return a default system prompt for intent analysis."""
+        intent_prompt = ChatPromptTemplate.from_template(
+            """You are an assistant for the {domain} domain.
+            Analyze the user's query and classify the type of action needed.
+            query: {query}
+            Respond with ONLY a JSON object:
+            {{
+                "action_type": "retrieve_data|create_record|update_record|delete_record|restock|other",
+                "filters": ["list of filters or conditions"],
+                "context": "brief description of what the user wants"
+            }}
+            Additional Notes:
+            - Use 'restock' as the action_type if the user mentions restocking, reordering, or replenishing stock.
+            - Ensure to identify specific SKUs or products if mentioned in the query.
+            - If no SKU is provided, clarify by asking which SKU the user wants to restock."""
+        )
+        messages = intent_prompt.format_messages(domain=self.domain, query=query)
+        return messages[0].content
+
     def handle_query(self, query: str, conversation_id: Optional[int] = None) -> str:
-        q = query.lower()
         try:
-            if ("stock" in q or "inventory" in q) and ("list" in q or "show" in q or "levels" in q or "status" in q):
-                return self._list_stock(query)
-            if ("product" in q or "products" in q) and ("expensive" in q or "cheapest" in q or "price" in q or "pricing" in q):
-                return self._list_products_by_price(query)
-            if "suppliers" in q and ("list" in q or "show" in q):
-                return self._list_suppliers(query)
-            if ("purchase order" in q or "po" in q) and ("create" in q or "new" in q):
+            # Step 1: Understand what the user wants
+            intent = self._analyze_intent(query)
+            logging.debug(intent)
+            # Step 2: Process based on the intent action_type
+            action_type = intent.get("action_type", "other")
+            filters = intent.get("filters", [])
+            context = intent.get("context", "")
+
+            # Step 3: Route to the appropriate handler based on action_type
+            if action_type == "retrieve_data":
+                # Handle data retrieval based on context
+                if any(term in context.lower() for term in ["stock", "inventory", "levels"]):
+                    return self._list_stock(query)
+                elif any(term in context.lower() for term in ["product", "price", "pricing", "expensive", "cheapest"]):
+                    return self._list_products_by_price(query)
+                elif "supplier" in context.lower():
+                    return self._list_suppliers(query)
+            elif action_type == "create_record" and any(term in context.lower() for term in ["purchase order", "po"]):
                 return self._create_dummy_po(query)
+            elif action_type == "restock":
+                import re
+                skus = re.findall(r"SKU-\d{4}", query.upper())
+                if not skus:
+                    return self._summarise(f"Which SKU do you want to restock?", query)
+                sku = skus[0]
+                logging.info("Restock request for SKU: %s", sku)
+                prod = self.sql.read("SELECT id FROM products WHERE sku=:s", {"s": sku})
+                if not prod:  return self._summarise(f"no product found {sku}", query)
+                pid = prod[0]["id"]
+                stock = self.sql.read("SELECT qty_on_hand, reorder_point FROM stock WHERE product_id=:p", {"p": pid})[0]
+                if stock["qty_on_hand"] < stock["reorder_point"]:
+                    # Create PO to bring it to 2x reorder
+                    target = stock["reorder_point"] * 2
+                    qty = max(0, target - stock["qty_on_hand"])
+                    self.sql.write("INSERT INTO purchase_orders (supplier_id, status) VALUES (1, 'draft')", {})
+                    po_id = self.sql.read("SELECT last_insert_rowid() AS id")[0]["id"]
+                    self.sql.write(
+                        "INSERT INTO po_items (po_id, product_id, quantity, unit_cost) VALUES (:po,:p,:q, 0.6)",
+                        {"po": po_id, "p": pid, "q": qty})
+                    return self._summarise(
+                        f"PO #{po_id} created to restock {sku} by {qty} units. data:po_id:{po_id}", query)
+                else:
+                    return self._summarise(f"{sku} is above reorder point. No action needed.", query)
+
             # Fallback RAG search
             rag_results = self.rag.search(query)
             if rag_results:
@@ -47,7 +106,8 @@ class InventoryAgent:
                     f"RAG search results for '{query}': {rag_results}", query
                 )
             return "I'm sorry, I couldn't understand your inventory request."
-        except Exception:
+        except Exception as e:
+            logging.error(e)
             raise
 
     def _summarise(self, raw_response: str, query: str) -> str:

@@ -61,10 +61,17 @@ This repository contains a modular, agent‑driven ERP prototype. It demonstrate
 
 ## Database
 
-- Default path: `project_data/erp.db` (override with `ERP_DB_PATH`).
+- Default path: `data/erp.db` (override with `ERP_DB_PATH`).
 - Contains minimal tables used by agents, plus optional `documents` and `saved_reports`.
 - On import, `tools/saved_reports.py` attempts to initialize default saved reports if the table exists.
+The system uses an SQLite database with the following key tables:
+- `customers`: Stores customer information.
+- `leads`: Tracks potential sales leads.
+- `orders`: Manages customer orders.
+- `invoices`: Handles billing and payments.
+- `products`: Maintains product catalog and pricing.
 
+Refer to `data/docs/db_schemas.txt` for the full schema.
 ## Vector RAG
 
 - `tools/vector_rag_tool.py` uses sentence‑transformers (`all‑MiniLM‑L6‑v2`) and ChromaDB.
@@ -109,13 +116,13 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2) Start LM Studio local server
-
-1. Open LM Studio
-2. Load a chat‑capable model
-3. Go to “Local Server” → Start Server (defaults to `http://localhost:1234`)
-4. Optional: set a custom URL via `LM_STUDIO_URL`
-
+### 2) Setup LLm Provider Gemini
+Update GOOGLE_API_KEY in .env
+Create a `.env` file in the project root with the following content:
+```
+GOOGLE_API_KEY=key
+ERP_DB_PATH=data/erp.db
+```
 ### 3) Run the FastAPI server
 
 From the project root:
