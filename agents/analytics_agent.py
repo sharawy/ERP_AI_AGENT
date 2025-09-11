@@ -132,7 +132,7 @@ class AnalyticsAgent(BaseAgent):
                             query)
 
             elif action_type == "revenue_analysis":
-                time_period = entities.get("time_period", "").lower()
+                time_period = entities.get("time_period", "").lower() if entities.get('time_period') else ""
                 if "day" in time_period:
                     return self._analyze_revenue_by_day(query)
                 elif "month" in time_period:
