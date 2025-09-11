@@ -17,12 +17,12 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 
 from agents import (
-    RouterAgent,
     SalesAgent,
     FinanceAgent,
     InventoryAgent,
     AnalyticsAgent,
 )
+from agents.react_router_agent import LangchainRouter
 from models.common import ChatRequest, ChatResponse, ListOrdersResponse, CreateOrderRequest, CreateOrderResponse
 from tools.sql_tool import SQLTool
 from tools.memory_manager import conversation_manager
@@ -33,18 +33,8 @@ app = FastAPI(title="Agent‑Driven ERP API")
 logging.basicConfig(level=logging.ERROR, format="%(asctime)s - %(levelname)s - %(message)s")
 load_dotenv()
 # Instantiate agents once at startup
-sales_agent = SalesAgent()
-finance_agent = FinanceAgent()
-inventory_agent = InventoryAgent()
-analytics_agent = AnalyticsAgent()
-router_agent = RouterAgent(
-    {
-        "sales": sales_agent,
-        "finance": finance_agent,
-        "inventory": inventory_agent,
-        "analytics": analytics_agent,
-    }
-)
+
+langchain_router = LangchainRouter()
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -60,27 +50,24 @@ def chat_endpoint(req: ChatRequest) -> ChatResponse:
         conversation_id = req.conversation_id
         if not conversation_id:
             conversation_id = conversation_manager.start_conversation()
-        
+
         # Add user message to conversation buffer
         conversation_manager.add_user_message(conversation_id, req.message)
-        
-        # Get conversation context for the router
-        context = conversation_manager.get_context_for_agent(conversation_id)
-        
-        # Route the query with enhanced context
-        result = router_agent.handle_chat(req.message, conversation_id, context)
-        
+
+        # Route the query using LangChain ReAct agent
+        result = langchain_router.run(req.message)
+
         # Add agent response to conversation buffer
-        conversation_manager.add_agent_response(conversation_id, result["response"], "system")
-        
+        conversation_manager.add_agent_response(conversation_id, result, "system")
+
         # Update global state
         GlobalState.set_last_module("router")
-        
+
     except Exception as e:
         print(e)
         logging.error(e)
         raise HTTPException(status_code=500, detail=str(e))
-    return ChatResponse(conversation_id=result["conversation_id"], response=result["response"])
+    return ChatResponse(conversation_id=conversation_id, response=result)
 
 
 @app.get("/orders", response_model=ListOrdersResponse)
